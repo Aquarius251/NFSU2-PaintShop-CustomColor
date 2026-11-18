@@ -300,6 +300,22 @@ static void load_store(void)
             strncpy(g_e[g_ne].car, car, 31); g_e[g_ne].slot = VINYLC + sn[6] - '1'; g_e[g_ne].part = part; g_e[g_ne].rgb = rgb & 0xFFFFFF; g_e[g_ne].seq = ++g_seq; g_ne++;
             continue;
         }
+        if (!_strnicmp(sn, "OPT_", 4) && g_ne < MAXE) {          /* E17: per-slot options (0x749 = matte rims) */
+            unsigned ob; Entry *ex;
+            if (sscanf(sn + 4, "%x", &ob) == 1 && ob < 0x100) {
+                if ((ex = find_e(car, 0x700 | ob))) { ex->rgb = rgb & 255; ex->seq = ++g_seq; continue; }
+                strncpy(g_e[g_ne].car, car, 31); g_e[g_ne].slot = 0x700 | ob; g_e[g_ne].part = 0; g_e[g_ne].rgb = rgb & 255; g_e[g_ne].seq = ++g_seq; g_ne++;
+            }
+            continue;
+        }
+        if (!_strnicmp(sn, "LIT_", 4) && g_ne < MAXE) {          /* v1.2: lightness of any slot */
+            unsigned lb; Entry *ex;
+            if (sscanf(sn + 4, "%x", &lb) == 1 && lb < 0x100) {
+                if ((ex = find_e(car, 0x600 | lb))) { ex->rgb = rgb & 255; ex->seq = ++g_seq; continue; }
+                strncpy(g_e[g_ne].car, car, 31); g_e[g_ne].slot = 0x600 | lb; g_e[g_ne].part = 0; g_e[g_ne].rgb = rgb & 255; g_e[g_ne].seq = ++g_seq; g_ne++;
+            }
+            continue;
+        }
         if (!_strnicmp(sn, "SAT_", 4) && g_ne < MAXE) {          /* E13: saturation of a vinyl / picture / decal slot */
             unsigned sb; Entry *ex;
             if (sscanf(sn + 4, "%x", &sb) == 1 && sb < 0x100) {
@@ -334,6 +350,8 @@ static void save_store(void)
             for (k = 0; k < NSLOT; k++) if (SLOTS[k].slot == e->slot) break;
             if (k < NSLOT) fprintf(f, "%s %s %08X %06X\n", e->car, SLOTS[k].name, e->part, e->rgb);
             else if ((e->slot & 0xF00) == 0x500) fprintf(f, "%s SAT_%02X %08X %06X\n", e->car, e->slot & 0xFF, e->part, e->rgb);
+            else if ((e->slot & 0xF00) == 0x600) fprintf(f, "%s LIT_%02X %08X %06X\n", e->car, e->slot & 0xFF, e->part, e->rgb);
+            else if ((e->slot & 0xF00) == 0x700) fprintf(f, "%s OPT_%02X %08X %06X\n", e->car, e->slot & 0xFF, e->part, e->rgb);
         }
     }
     fclose(f);
@@ -423,7 +441,7 @@ static int custom_for(BYTE *ride, int slot, DWORD *rgb)
        the picker move the colour to the new part (move_custom), vinyl keys are matched by vinyl part in find_r. */
     /* picture vinyl colours (0x240..0x243): E3 - each picture its own colour (find_pic by the layer's vinyl part); a picture
        without one shows its own colours (the user's "Default") */
-    if (e && 0 != part_hash(p) && (!e->part || e->part == part_hash(p) || is_vinyl_slot(slot & 0xFF) || (slot & 0xFF) >= 0x9a || (slot >= 0x240 && slot <= 0x243) || ((slot & 0xF00) == 0x200 && (slot & 0xFF) >= 0x61 && (slot & 0xFF) <= 0x98) || (slot & 0xF00) == 0x500)) { *rgb = e->rgb; ok = 1; }   /* E8: a decal SLOT keeps its colour for any decal put there */
+    if (e && 0 != part_hash(p) && (!e->part || e->part == part_hash(p) || is_vinyl_slot(slot & 0xFF) || (slot & 0xFF) >= 0x9a || (slot >= 0x240 && slot <= 0x243) || ((slot & 0xF00) == 0x200 && (slot & 0xFF) >= 0x61 && (slot & 0xFF) <= 0x98) || (slot & 0xF00) == 0x500 || (slot & 0xF00) == 0x600 || (slot & 0xF00) == 0x700)) { *rgb = e->rgb; ok = 1; }   /* E8: a decal SLOT keeps its colour for any decal put there */
     LeaveCriticalSection(&g_cs);
     return ok;
 }
@@ -537,6 +555,127 @@ static int sat_slot_ok(int slot)
     return (slot < 0x100 && (b == 0x3f || (b >= 0x45 && b <= 0x4c) || (b >= 0x4d && b <= 0x5c)))
         || (slot >= 0x240 && slot <= 0x243) || ((slot & 0xF00) == 0x200 && b >= 0x61 && b <= 0x98);
 }
+/* v1.2 LIGHTNESS (0..200 %, stored 0..255 at 0x600 | (slot & 0xFF), 128 = 100 % = as before). White paint looked dull: a
+   custom paint gets a neutral copy of the fitted paint type's light material (so the colour shows as picked) whose
+   brightness is the AVERAGE of that material's colour - a red pearl (0.8, 0.2, 0.2) averages 0.4, so a white body showed
+   grey. Paints (body + painted parts): the material's diffuse brightness x L (above 100 % the highlights rise too) -
+   a bright, glossy white. Vinyl colours, picture tints, decals: the colour itself, darker below 100 %, towards white above. */
+static float lit_of(DWORD v)            /* E16: stored 0..255 -> 0..100 % linear up to 128, then 100..300 % */
+{
+    v &= 255; return v <= 128 ? v / 128.f : 1.f + (v - 128) / 127.f * 2.f;
+}
+static float lit_amt(BYTE *ride, int slot)
+{
+    DWORD a; if (!custom_for(ride, 0x600 | (slot & 0xFF), &a)) return 1.f;
+    return lit_of(a);
+}
+static DWORD lit_rgb(DWORD c, float L)              /* colour lightness: x L below 100 %, a gamma lift above (darks rise most) */
+{
+    DWORD out = 0; int k;
+    if (L > 0.995f && L < 1.005f) return c & 0xFFFFFF;
+    for (k = 16; k >= 0; k -= 8) {
+        float v = (float)((c >> k) & 255);
+        v = L < 1.f ? v * L : 255.f * powf(v / 255.f, 1.f / (1.f + 0.75f * (L - 1.f)));
+        out |= (DWORD)(v < 0 ? 0 : v > 255 ? 255 : v + .5f) << k;
+    }
+    return out;
+}
+/* E15: the paint's shading = skin x (Min + (Max - Min) x facing): surfaces turned away fall to the edge colour Min - the dark
+   areas. Above 100 % Lightness LIFTS the shadows instead of scaling everything: per channel (effective colour x scale)
+   the head-on value rises towards 0.95 and the edge value fills towards it, both by t = L - 1. At 200 % the paint is
+   evenly bright (no shading), values above 1.0 and the highlights / reflections are left alone (nothing blows out).
+   Mock-up: screenshots\lightness_E14_vs_E15_mock.png. Below 100 %: darker, as before. */
+static void lit_mat(BYTE *dst, float L, int part, DWORD skin)
+{
+    /* E16 ("not light enough", tested on rims): up to 300 %. Shadows fill fully by 200 % (as E15). The head-on value rises
+       towards a target: BODY (its texture is the colour itself) = the value where the brightest colour channel reaches 97 %
+       - near-white, never clipped into a flat blob; PARTS (rims, calipers ... a grey pearl / chrome texture x the light) =
+       3.2, overbright, reached at 300 %, so their dark textures come out near-white. Below 100 %: darker, as before. */
+    float *f = (float *)dst, smn, smx, fill, pr, tgt; int c;
+    if (L > 0.995f && L < 1.005f) return;
+    if (L < 1.f) { for (c = 0; c < 3; c++) { f[0x34 / 4 + c] *= L; f[0x44 / 4 + c] *= L; } return; }
+    fill = L - 1.f; if (fill > 1.f) fill = 1.f;
+    /* (bolder after "make it much white": the top of the range is clearly pure white) */
+    if (part) { tgt = 3.5f + (L > 2.f ? L - 2.f : 0.f); pr = fill; }        /* 3.5 by 200 %, 4.5 at 300 % */
+    else {
+        float km = (float)max(max((skin >> 16) & 255, (skin >> 8) & 255), skin & 255) / 255.f;
+        if (km < 0.05f) km = 0.05f;
+        tgt = 1.f / km; if (tgt > 2.5f) tgt = 2.5f; pr = fill;               /* the brightest channel at full by 200 % */
+        if (L > 2.f) tgt *= 1.f + 0.25f * (L - 2.f);                          /* 300 %: a little overbright - pure white */
+    }
+    smn = f[0x30 / 4] > 0.f ? f[0x30 / 4] : 1.f; smx = f[0x40 / 4] > 0.f ? f[0x40 / 4] : 1.f;
+    for (c = 0; c < 3; c++) {
+        float mn = f[0x34 / 4 + c] * smn, mx = f[0x44 / 4 + c] * smx;
+        if (mx < tgt) mx += (tgt - mx) * pr;
+        if (mn < mx) mn += (mx - mn) * fill;
+        f[0x34 / 4 + c] = mn / smn; f[0x44 / 4 + c] = mx / smx;
+    }
+}
+/* E16 SHINE 0 % = NO MATERIAL SHINE (user: "shine will remove shine from material"): the paint type's own pearl / metallic
+   edge colour and its darker edges are switched off - the colour is lit flat at exactly 1.0 (body) or the part's usual
+   brightness (parts: their textures are darker), so it shows as picked: white is white. Reflections stay (Gloss). */
+/* E17 MATTE RIMS. The remaining grey shading on white rims is baked into the rim texture: the car's texture table (cri +0x6a0
+   in the shop: entry {orig hash, DUMMY_WHEEL1 0xbd97dd90, TextureInfo*, ?}; spinner DUMMY_SPINNER1 0x43c90bba) points at
+   the composited wheel texture (the rim's pearl / chrome picture x the colour). Matte (0x749 = 1): each frame those entries
+   point at our copy of that texture - every texel the rim colour, the alpha kept (cut-outs stay) - and the rim material is
+   matte: no reflection / highlights, soft natural shading (edges 78 %, facing 100 %). Lightness / saturation act on the
+   colour. Spinner: the same option, its own colour. */
+/* E22 (user: "remove matte check, shine does the same"): no checkbox any more. The rim's Shine amount below 25 % fades in the
+   matte look - chrome reflection / highlights off (chrome_mat) AND the rim picture's painted chrome flattened (rim pixels
+   only, tyre untouched) down to MatteTexture % of its contrast at 0 %. Old OPT_49 lines load and are ignored. */
+static float shine_flat(BYTE *ride, int slot);
+static float matte_t(BYTE *ride) { return shine_flat(ride, 0x49); }
+static int matte_on(BYTE *ride) { return matte_t(ride) > 0.f; }
+/* E19: the tyre shares the wheel texture (DUMMY_WHEELn) - the flat copy turned the tyres cyan too. With matte on, the rim /
+   spinner are composited in MATTE_KEY (magenta): a composited pixel = the rim picture's grey x the colour on the rim, the
+   tyre / sidewall lettering stay neutral. The copy recolours by the key's strength w = (min(R, B) - G) / min(R, B):
+   rim -> the picked colour, tyre -> untouched, soft edges blended. */
+#define MATTE_KEY 0xFF00FF
+static float g_matteKeep;   /* (defined with the ini default further down) */
+static float g_partBright;
+static void matte_mat(BYTE *dst, float L)
+{
+    /* E18: facing = the parts' usual brightness (PartBrightness, 1.35: the light the car shader gets in the shop shows a
+       part at ~1/1.35 - with it the matte rim matches the swatch), edges 80 % of it. Lightness above 100 % fills the edges
+       (even at 200 %) and adds up to +50 % brightness at 300 %. */
+    float *f = (float *)dst, mx = g_partBright > 0.3f ? g_partBright : 1.35f, mn; int c;
+    if (L > 1.f) mx *= 1.f + 0.25f * (L - 1.f > 2.f ? 2.f : L - 1.f);
+    mn = mx * 0.8f;
+    if (L > 1.f) mn += (mx - mn) * (L - 1.f > 1.f ? 1.f : L - 1.f);
+    f[0x30 / 4] = 1.f; f[0x40 / 4] = 1.f;
+    for (c = 0; c < 3; c++) { f[0x34 / 4 + c] = mn; f[0x44 / 4 + c] = mx; f[0x60 / 4 + c] = 0.f; f[0x70 / 4 + c] = 0.f; f[0x84 / 4 + c] = 0.f; f[0x94 / 4 + c] = 0.f; }
+}
+/* E21: "no material shine" fades in over the lowest quarter of the Shine slider (stored 32 -> 0) instead of switching at
+   exactly 0 % - dragging past the left end jumped from the grey shading to the flat white */
+static float shine_flat(BYTE *ride, int slot)
+{
+    DWORD a; int v;
+    if (!custom_for(ride, 0x300 | (slot & 0xFF), &a)) return 0.f;
+    v = a & 255; return v >= 32 ? 0.f : (32 - v) / 32.f;
+}
+static int shine_off(BYTE *ride, int slot) { return shine_flat(ride, slot) > 0.f; }
+static float g_matteEven = 1.6f;     /* ini MatteEven: rims at Shine 0 % - extra light so the darker faces even out (1 = none) */
+static void flat_mat(BYTE *dst, int part, int rim, float t)        /* t: 0 = the material as is .. 1 = flat (E21) */
+{
+    float *f = (float *)dst, smn = f[0x30 / 4] > 0.f ? f[0x30 / 4] : 1.f, smx = f[0x40 / 4] > 0.f ? f[0x40 / 4] : 1.f; int c;
+    if (t <= 0.f) return; if (t > 1.f) t = 1.f;
+    for (c = 0; c < 3; c++) {
+        float mn = f[0x34 / 4 + c] * smn, mx = f[0x44 / 4 + c] * smx, fl = rim ? 2.8f : 1.f, v = part ? (mx > fl ? mx : fl) : 1.f;   /* rims: dark chrome texture */
+        /* E23: rims also get extra light by t: the faces the game shades darker (the rim picture's grey x the angle /
+           model shading) rise towards the bright ones - nearly even, a little form left (ini MatteEven) */
+        if (rim) v *= 1.f + (g_matteEven - 1.f) * t;
+        f[0x34 / 4 + c] = (mn + (v - mn) * t) / smn; f[0x44 / 4 + c] = (mx + (v - mx) * t) / smx;
+    }
+}
+/* E16 RIM CHROME (user: "shine at rims should remove chrome effect"): on the rim slot the Shine amount below 100 % fades the
+   chrome - the reflection (envmap) and the highlights - to none at 0 % (a flat painted rim). */
+static void chrome_mat(BYTE *dst, float k)
+{
+    float *f = (float *)dst; int c;
+    if (k >= 0.999f) return; if (k < 0.f) k = 0.f;
+    for (c = 0; c < 3; c++) { f[0x60 / 4 + c] *= k; f[0x70 / 4 + c] *= k; f[0x84 / 4 + c] *= k; f[0x94 / 4 + c] *= k; }
+}
+static int is_paint_slot(int slot) { int b = slot & 0xFF; return slot < 0x100 && (b == 0x3f || (b >= 0x45 && b <= 0x4c)); }
 static float sat_amt(BYTE *ride, int slot)
 {
     DWORD a; if (!custom_for(ride, 0x500 | (slot & 0xFF), &a)) return 1.f;
@@ -588,11 +727,13 @@ static int __cdecl h_comp(BYTE *ride)
                     DWORD sh;                                    /* shine / gloss / saturation without own base: the part's colour */
                     int so = shine_of(SLOTS[i].slot);
                     if (!((so && g_kindOn[K_SHINE] && custom_for(ride, so, &sh)) || (SLOTS[i].slot == 0x3f && custom_for(ride, GLOSS_SLOT, &sh))
-                          || (SLOTS[i].slot < 0x100 && custom_for(ride, 0x500 | SLOTS[i].slot, &sh)))) continue;
+                          || (SLOTS[i].slot < 0x100 && custom_for(ride, 0x500 | SLOTS[i].slot, &sh))
+                          || (SLOTS[i].slot < 0x100 && !is_paint_slot(SLOTS[i].slot) && custom_for(ride, 0x600 | SLOTS[i].slot, &sh)))) continue;
                     rgb = game_rgb(ride, SLOTS[i].slot);
                 }
                 {   float sa = SLOTS[i].slot < 0x100 ? sat_amt(ride, SLOTS[i].slot) : 1.f;
                     rgb = sat_rgb(rgb, sa);
+                    if (SLOTS[i].slot < 0x100 && !is_paint_slot(SLOTS[i].slot)) rgb = lit_rgb(rgb, lit_amt(ride, SLOTS[i].slot));   /* v1.2 */
                     if (shine_of(SLOTS[i].slot) && g_kindOn[K_SHINE] && custom_for(ride, shine_of(SLOTS[i].slot), &tmpS)) {
                         float am = shine_amt(ride, SLOTS[i].slot);
                         tmpS = sat_rgb(tmpS, sa);
@@ -730,7 +871,7 @@ static void vinyl_tint_job(BYTE *job)
           if (k2 == ns && ns < 32) { seen[ns++] = *(DWORD *)L; clog("vinyl layer %d: %s %dx%d tint flag %lu -> %s", i, nm, w, h, *(DWORD *)(L + 0x20), pic_vinyl(nm) ? "picture, gets the vinyl colour" : "left to the game"); } }
         if (!pic_vinyl(nm) || lay < 0 || w <= 0 || h <= 0 || w > 4096 || h > 4096 || !readable(px, (size_t)w * h * 4)) continue;
         if (!custom_for(g_compMine, 0x240 + lay, &rgb)) continue;          /* no colour of its own: the picture as it is */
-        rgb = sat_rgb(rgb, sat_amt(g_compMine, 0x240 + lay));             /* E13 */
+        rgb = lit_rgb(sat_rgb(rgb, sat_amt(g_compMine, 0x240 + lay)), lit_amt(g_compMine, 0x240 + lay));   /* E13 + v1.2 */
         if ((t = vinyl_tinted(px, w, h, rgb))) { *(DWORD **)(L + 0xc) = t; g_tintSig = g_tintSig * 31 + (rgb | 0x1000000) + (DWORD)i * 0x9E3779B1u; }
     }
     }
@@ -1145,7 +1286,7 @@ static void decal_sweep(void)
             if (!e->clone || !e->nt || !e->ride || now - e->seen > 2000 || now - e->t < 30 || !ride_live(e->ride)) continue;
             if (!readable(e->orig, 0x28) || *(DWORD *)(e->orig + 0x24) != e->hash) continue;   /* E10: slot reused - rebuilt by decal_clone2 */
             if (!readable(e->ride, 0x590 + 170 * 4) || !custom_for(e->ride, 0x200 | (0x61 + e->sl), &rgb)) continue;
-            rgb = sat_rgb(rgb, sat_amt(e->ride, 0x200 | (0x61 + e->sl)));
+            rgb = lit_rgb(sat_rgb(rgb, sat_amt(e->ride, 0x200 | (0x61 + e->sl))), lit_amt(e->ride, 0x200 | (0x61 + e->sl)));
             if (rgb == e->rgb) continue;
             src = decal_white(e->orig); pi = readable(src, 0x7c) ? *(BYTE **)src : NULL;
             if (!readable(pi, 0x20) || !(tex = *(IDirect3DTexture9 **)(pi + 0x18))) continue;
@@ -1164,7 +1305,7 @@ static void decal_fix(BYTE *cri, BYTE *ride)
     for (k = 0; k < 7; k++) {
         for (j = 0; j < 8; j++) {
             has = part_of(ride, 0x61 + k * 8 + j) && custom_for(ride, 0x200 | (0x61 + k * 8 + j), &rgb);   /* each decal slot its own colour */
-            if (has) rgb = sat_rgb(rgb, sat_amt(ride, 0x200 | (0x61 + k * 8 + j)));                        /* E13 */
+            if (has) rgb = lit_rgb(sat_rgb(rgb, sat_amt(ride, 0x200 | (0x61 + k * 8 + j))), lit_amt(ride, 0x200 | (0x61 + k * 8 + j)));   /* E13 + v1.2 */
             DWORD *e = (DWORD *)(cri + 0x13e8 + k * 0x80 + j * 16); BYTE *ti = (BYTE *)e[2], *o, *c;
             if (e[0] != 0x910e6654 + (DWORD)j || !ti || ti == (BYTE *)-1) continue;          /* DUMMY_DECAL1..8 */
             if (e[1] == 0x66994f4a) { if (decal_orig(ti) != ti) e[2] = (DWORD)decal_orig(ti); continue; }   /* DEFAULTALPHA = empty spot */
@@ -1200,16 +1341,24 @@ static BYTE *paint_mat_(BYTE *cri, DWORD off)
     if (off == 0x384) { __try { decal_fix(cri, ride); } __except (EXCEPTION_EXECUTE_HANDLER) { static int n; if (n++ < 5) clog("decal colour: exception 0x%08lx", GetExceptionCode()); } }
     if (off == 0x384 && g_rimLodFix) fix_lod_textures(cri);
     if (off == 0x384 || (off == 0x39c && v == mat)) {                       /* body paint */
-        int shine = g_kindOn[K_SHINE] && custom_for(ride, SHINE_SLOT, &srgb), base = custom_for(ride, 0x3f, &brgb);
-        if (!shine && !base) return v;
+        int shine = g_kindOn[K_SHINE] && custom_for(ride, SHINE_SLOT, &srgb), base = custom_for(ride, 0x3f, &brgb); float li = lit_amt(ride, 0x3f);
+        if (!shine && !base && li > 0.995f && li < 1.005f) return v;
         st = cri_state(cri);
+        if (!shine && !base) {                     /* v1.2: lightness on the game's own paint: its material, brighter / darker */
+            key = 0x3C3C3C3C ^ (DWORD)v ^ ((DWORD)(li * 1000.f) * 2246822519u);
+            if (!(st->mask & 0x20) || st->key != key) { memcpy(st->mat, v, 0xa8); lit_mat(st->mat, li, 0, game_rgb(ride, 0x3f)); st->key = key; st->orig = v; st->mask |= 0x20; }
+            return st->mat;
+        }
         if (!base) brgb = game_rgb(ride, 0x3f);
         {   float sa = sat_amt(ride, 0x3f);
             brgb = sat_rgb(brgb, sa); if (shine) srgb = sat_rgb(srgb, sa);
             if (shine) srgb = shine_amount(ride, 0x3f, brgb, srgb);
-            key = shine ? srgb ^ (brgb * 31) ^ (DWORD)v ^ ((DWORD)(shine_amt(ride, 0x3f) * 1000.f) * 2654435761u) ^ ((DWORD)(sa * 1000.f) * 40503u) : 0x5A5A5A5A ^ (DWORD)v;
+            key = (shine ? srgb ^ (brgb * 31) ^ (DWORD)v ^ ((DWORD)(shine_amt(ride, 0x3f) * 1000.f) * 2654435761u) ^ ((DWORD)(sa * 1000.f) * 40503u) : 0x5A5A5A5A ^ (DWORD)v)
+                  ^ ((DWORD)(li * 1000.f) * 2246822519u) ^ ((DWORD)(shine_flat(ride, 0x3f) * 1000.f) * 0x0F0F0F0Fu);
         if (!(st->mask & 0x20) || st->key != key) {
             if (shine) make_shine(st->mat, v, brgb, srgb, 0.f, shine_amt(ride, 0x3f), sa); else make_neutral(st->mat, v, 0.f);
+            flat_mat(st->mat, 0, 0, shine_flat(ride, 0x3f));
+            lit_mat(st->mat, li, 0, brgb);
             st->key = key; st->orig = v; st->mask |= 0x20;
             clog("body: car %p uses its own copy of %s (%s)", cri, (char *)v + 0x14, shine ? "base + shine" : "neutral");
         }
@@ -1220,16 +1369,32 @@ static BYTE *paint_mat_(BYTE *cri, DWORD off)
         if (slot < 0 || i < 0 || i > 7) return v;
         has = custom_for(ride, slot, &rgb);
         sh = g_kindOn[K_SHINE] && custom_for(ride, 0x100 | slot, &srgb);
-        if (!has && !sh) return v;
+        {   float li0 = lit_amt(ride, slot);
+            if (slot == 0x49 && matte_on(ride) && !has) { has = 1; rgb = game_rgb(ride, slot); }   /* E17 */
+            if (!has && !sh && li0 > 0.995f && li0 < 1.005f) return v;
+            if (!has && !sh) {                     /* v1.2: lightness on the game's own colour of this part */
+                st = cri_state(cri); key = 0x3D3D3D3D ^ ((DWORD)(li0 * 1000.f) * 2246822519u);
+                if (st->psrc[i] != v || st->pkey[i] != key || !(st->mask & 0x40)) { memcpy(st->pm[i], v, 0xa8); lit_mat(st->pm[i], li0, 1, 0); st->psrc[i] = v; st->pkey[i] = key; st->mask |= 0x40; }
+                return st->pm[i];
+            }
+        }
         if (!has) rgb = game_rgb(ride, slot);
         {   float sa = sat_amt(ride, slot);
             rgb = sat_rgb(rgb, sa); if (sh) srgb = sat_rgb(srgb, sa);
         if (sh) srgb = shine_amount(ride, slot, rgb, srgb);
         st = cri_state(cri);
-        key = sh ? (srgb ^ (rgb * 31) ^ 0x80000000 ^ ((DWORD)(shine_amt(ride, slot) * 1000.f) * 2654435761u) ^ ((DWORD)(sa * 1000.f) * 40503u)) : 0x12345;
+        key = (sh ? (srgb ^ (rgb * 31) ^ 0x80000000 ^ ((DWORD)(shine_amt(ride, slot) * 1000.f) * 2654435761u) ^ ((DWORD)(sa * 1000.f) * 40503u)) : 0x12345)
+              ^ ((DWORD)(lit_amt(ride, slot) * 1000.f) * 2246822519u) ^ ((DWORD)(shine_flat(ride, slot) * 1000.f) * 0x0F0F0F0Fu)
+              ^ (slot == 0x49 ? (DWORD)(shine_amt(ride, slot) * 1000.f) * 97u : 0u);
         if (st->psrc[i] != v || st->pkey[i] != key || !(st->mask & 0x40)) {
             float kb = slot == 0x49 ? g_rimBright : g_partBright;
             if (sh) make_shine(st->pm[i], v, rgb, srgb, kb, shine_amt(ride, slot), sa); else make_neutral(st->pm[i], v, kb);
+            flat_mat(st->pm[i], 1, slot == 0x49, shine_flat(ride, slot));
+            if (slot == 0x49) { DWORD a; if (custom_for(ride, 0x300 | 0x49, &a)) chrome_mat(st->pm[i], (a & 255) / 128.f); }
+            lit_mat(st->pm[i], lit_amt(ride, slot), 1, rgb);
+            /* E19 (user's decision): Matte = only the GLOSS off - no chrome reflection, no highlights. The rim texture and the
+               Base / Shine two-colour change across angles stay; the tyre is never touched (no texture swap any more). */
+            /* (E22: the matte gloss-off is chrome_mat(Shine amount) above - 0 at 0 %) */
             st->psrc[i] = v; st->pkey[i] = key; st->mask |= 0x40;
             clog("part %02x: car %p uses its own copy of %s (%s)", slot, cri, (char *)v + 0x14, sh ? "base + shine" : "neutral");
         }
@@ -1302,6 +1467,143 @@ static void hook_matreads(void)
     for (i = 0; i < (int)(sizeof S / sizeof S[0]); i++) n += hook_matread(S[i].at, S[i].b, (S[i].at == 0x6308e8 || S[i].at == 0x6308f1) ? 0x10000 : 0);
     clog("paint materials: %d of %d reads hooked", n, (int)(sizeof S / sizeof S[0]));
 }
+
+/* E17: matte rim texture copies */
+typedef struct { BYTE *orig, *clone; IDirect3DTexture9 *src, *nt; DWORD rgb; long comp; float keep; } MatteTex;
+static float g_mKeepNow = 1.f;     /* E22: the contrast kept in this fill (1 = the picture as is .. MatteTexture at Shine 0 %) */
+static MatteTex g_mt[24]; static int g_nmt;
+static int g_mdump;
+static void tga_dump(const char *name, const BYTE *bits, int pitch, int w, int h)   /* debug (Log=1): one level-0 picture */
+{
+    char fn[MAX_PATH]; FILE *f; BYTE hd[18]; int y;
+    sprintf(fn, "%s\\%s.tga", g_dir, name);
+    if (!(f = fopen(fn, "wb"))) return;
+    memset(hd, 0, 18); hd[2] = 2; hd[12] = (BYTE)w; hd[13] = (BYTE)(w >> 8); hd[14] = (BYTE)h; hd[15] = (BYTE)(h >> 8); hd[16] = 32; hd[17] = 0x28;
+    fwrite(hd, 1, 18, f); for (y = 0; y < h; y++) fwrite(bits + y * pitch, 4, w, f); fclose(f);
+}
+static int matte_fill(IDirect3DTexture9 *tex, IDirect3DTexture9 *nt, DWORD rgb, int dxt)
+{
+    DWORD lv = IDirect3DTexture9_GetLevelCount(tex), L; int bs = dxt == 1 ? 8 : 16, co = dxt == 1 ? 0 : 8;
+    WORD c565 = (WORD)((((rgb >> 19) & 31) << 11) | (((rgb >> 10) & 63) << 5) | ((rgb >> 3) & 31));
+    for (L = 0; L < lv; L++) {
+        D3DLOCKED_RECT a, b; D3DSURFACE_DESC d2; int rows, y, x, cols;
+        IDirect3DTexture9_GetLevelDesc(tex, L, &d2);
+        if (FAILED(IDirect3DTexture9_LockRect(tex, L, &a, NULL, D3DLOCK_READONLY))) return 0;
+        if (FAILED(IDirect3DTexture9_LockRect(nt, L, &b, NULL, 0))) { IDirect3DTexture9_UnlockRect(tex, L); return 0; }
+        rows = dxt ? ((int)d2.Height + 3) / 4 : (int)d2.Height; cols = dxt ? ((int)d2.Width + 3) / 4 : (int)d2.Width;
+        for (y = 0; y < rows; y++) memcpy((BYTE *)b.pBits + y * b.Pitch, (BYTE *)a.pBits + y * a.Pitch, dxt ? cols * bs : cols * 4);
+        IDirect3DTexture9_UnlockRect(tex, L);
+        {   if (g_log && L == 0 && !dxt && g_mdump < 2) {                                                  /* debug: the composited original */
+                char nm[48]; sprintf(nm, "NFSU2_CustomColor_matte%d_original", g_mdump); tga_dump(nm, (BYTE *)b.pBits, b.Pitch, cols, rows); } }
+        {   /* E20: the composite marked the rim with MATTE_KEY: rim pixel = (p, 0, p) with p = the rim picture's brightness.
+               Matte keeps the picture but pulls its painted chrome bands towards their mean (g_matteKeep of the contrast),
+               then gives it the colour; neutral pixels (tyre, lettering) stay as they are. */
+            double sum = 0; int cnt = 0; float mean = 0.5f;
+            if (!dxt) for (y = 0; y < rows; y++) for (x = 0; x < cols; x++) {
+                DWORD c = *(DWORD *)((BYTE *)b.pBits + y * b.Pitch + x * 4); int R2 = (c >> 16) & 255, G2 = (c >> 8) & 255, B2 = c & 255, lo = R2 < B2 ? R2 : B2;
+                if (lo > 8 && lo - G2 > lo / 2) { sum += lo; cnt++; }
+            }
+            if (cnt) mean = (float)(sum / cnt) / 255.f;
+        for (y = 0; y < rows; y++) for (x = 0; x < cols; x++) {
+            if (dxt) { BYTE *cb = (BYTE *)b.pBits + y * b.Pitch + x * bs + co; *(WORD *)cb = *(WORD *)(cb + 2) = c565; }   /* (DXT: one colour, indices / cut-outs kept) */
+            else {
+                DWORD *px = (DWORD *)((BYTE *)b.pBits + y * b.Pitch + x * 4), c = *px;
+                int R2 = (c >> 16) & 255, G2 = (c >> 8) & 255, B2 = c & 255, lo = R2 < B2 ? R2 : B2, k2; float w, pp; DWORD o2 = 0;
+                w = lo > G2 ? (float)(lo - G2) / (float)(lo > 8 ? lo : 8) : 0.f; if (w > 1.f) w = 1.f;
+                if (w < 0.02f) continue;                                          /* tyre / neutral: untouched */
+                pp = (lo - G2) / 255.f / (w > 0.05f ? w : 0.05f);                 /* the picture's brightness under the key */
+                pp = mean + (pp - mean) * g_mKeepNow; if (pp < 0.f) pp = 0.f; if (pp > 1.f) pp = 1.f;
+                for (k2 = 16; k2 >= 0; k2 -= 8) o2 |= (DWORD)(G2 * (1.f - w) + ((rgb >> k2) & 255) * pp * w + .5f) << k2;
+                *px = (c & 0xFF000000) | o2;
+            }
+        }
+        }
+        {   if (g_log && L == 0 && !dxt && g_mdump < 2) {                                                  /* debug: our copy */
+                char nm[48]; sprintf(nm, "NFSU2_CustomColor_matte%d_copy", g_mdump++); tga_dump(nm, (BYTE *)b.pBits, b.Pitch, cols, rows); } }
+        IDirect3DTexture9_UnlockRect(nt, L);
+    }
+    return 1;
+}
+static BYTE *matte_tex(BYTE *ti, DWORD rgb)
+{
+    BYTE *pi; IDirect3DTexture9 *tex; D3DSURFACE_DESC dsc; MatteTex *m = NULL; int i, dxt;
+    if (!readable(ti, 0x7c) || !readable(pi = *(BYTE **)ti, 0x60) || !(tex = *(IDirect3DTexture9 **)(pi + 0x18))) return NULL;
+    for (i = 0; i < g_nmt; i++) if (g_mt[i].orig == ti) { m = &g_mt[i]; break; }
+    if (m && m->src == tex && m->rgb == rgb && m->nt && m->comp == g_cComp && m->keep == g_mKeepNow) return m->clone;
+    if (FAILED(IDirect3DTexture9_GetLevelDesc(tex, 0, &dsc))) return NULL;
+    dxt = dsc.Format == D3DFMT_DXT1 ? 1 : (dsc.Format == D3DFMT_DXT2 || dsc.Format == D3DFMT_DXT3 || dsc.Format == D3DFMT_DXT4 || dsc.Format == D3DFMT_DXT5) ? 2
+        : (dsc.Format == D3DFMT_A8R8G8B8 || dsc.Format == D3DFMT_X8R8G8B8) ? 0 : -1;
+    if (dxt < 0) { static int n; if (n++ < 3) clog("matte rims: texture format %08lx not supported", (DWORD)dsc.Format); return NULL; }
+    if (!m) {
+        if (g_nmt >= 24) return NULL;
+        m = &g_mt[g_nmt]; memset(m, 0, sizeof *m); m->orig = ti;
+        if (!(m->clone = (BYTE *)calloc(1, 0x7c + 0x60))) return NULL;
+        g_nmt++;
+    }
+    if (m->src != tex || !m->nt) {                                   /* (re)create the copy's texture */
+        IDirect3DDevice9 *dev = NULL; IDirect3DTexture9 *nt = NULL; BYTE *c = m->clone;
+        IDirect3DTexture9_GetDevice(tex, &dev);
+        if (!dev || FAILED(IDirect3DDevice9_CreateTexture(dev, dsc.Width, dsc.Height, IDirect3DTexture9_GetLevelCount(tex), 0, dsc.Format, D3DPOOL_MANAGED, &nt, NULL))) {
+            if (dev) IDirect3DDevice9_Release(dev); return NULL; }
+        IDirect3DDevice9_Release(dev);
+        memcpy(c, ti, 0x7c); memcpy(c + 0x7c, pi, 0x60);
+        *(BYTE **)c = c + 0x7c; *(BYTE **)(c + 4) = NULL; *(BYTE **)(c + 8) = NULL;
+        *(BYTE **)(c + 0x7c) = c + 0x7c; *(BYTE **)(c + 0x7c + 4) = c + 0x7c;
+        *(IDirect3DTexture9 **)(c + 0x7c + 0x18) = nt;
+        if (m->nt) IDirect3DTexture9_Release(m->nt);
+        m->nt = nt; m->src = tex; m->rgb = 0xFFFFFFFF;
+    }
+    if (!matte_fill(tex, m->nt, rgb, dxt)) { static int n; if (n++ < 5) clog("matte rims: cannot read %s (format %08lx)", (char *)ti + 0xc, (DWORD)dsc.Format); return NULL; }
+    m->rgb = rgb; m->comp = g_cComp; m->keep = g_mKeepNow;
+    { static int n; if (n++ < 20) clog("matte rims: %s -> %06lX on the rim pixels (tyre kept)", (char *)ti + 0xc, rgb); }
+    return m->clone;
+}
+static BYTE *matte_orig(BYTE *ti) { int i; for (i = 0; i < g_nmt; i++) if (g_mt[i].clone == ti) return g_mt[i].orig; return ti; }
+/* E18: matte colour = the newest of the slot's Base and Shine colours (the Shine tab has no meaning on a matte rim: a pick
+   there must show too), else the game's colour */
+static DWORD matte_rgb(BYTE *ride, int slot)
+{
+    const char *car = car_name(ride); Entry *b, *sh; DWORD c;
+    if (!car) return game_rgb(ride, slot);
+    EnterCriticalSection(&g_cs);
+    b = find_e(car, slot); sh = g_kindOn[K_SHINE] ? find_e(car, 0x100 | slot) : NULL;
+    if (b && sh) c = sh->seq > b->seq ? sh->rgb : b->rgb; else if (b) c = b->rgb; else if (sh) c = sh->rgb; else c = 0xFFFFFFFF;
+    LeaveCriticalSection(&g_cs);
+    return c == 0xFFFFFFFF ? game_rgb(ride, slot) : c & 0xFFFFFF;
+}
+static float g_matteKeep = 0.35f;            /* ini MatteTexture (%): how much of the rim picture's painted contrast Matte keeps */
+static DWORD comp_rgb(BYTE *ride, int slot)
+{
+    DWORD rgb, tmpS; float sa = sat_amt(ride, slot);
+    if (!custom_for(ride, slot, &rgb)) rgb = game_rgb(ride, slot);
+    rgb = sat_rgb(rgb, sa);
+    if (shine_of(slot) && g_kindOn[K_SHINE] && custom_for(ride, shine_of(slot), &tmpS)) {
+        float am = shine_amt(ride, slot);
+        tmpS = sat_rgb(tmpS, sa);
+        rgb = shine_skin2(am > 1.f ? mix_rgb(rgb, tmpS, 0.85f * (am - 1.f)) : rgb, sa);
+    }
+    return rgb & 0xFFFFFF;
+}
+static void matte_fix(BYTE *cri, BYTE *ride)
+{
+    static DWORD hW, hS; int a, on; DWORD rgbW, rgbS;
+    if (!hW) { hW = bin_hash("DUMMY_WHEEL1"); hS = bin_hash("DUMMY_SPINNER1"); }
+    if (!readable(cri + 0x600, 0x1800)) return;
+    on = matte_on(ride);
+    if (on) { float t = matte_t(ride); g_mKeepNow = 1.f - t * (1.f - g_matteKeep); }
+    if (on) {
+        rgbW = comp_rgb(ride, 0x49); rgbS = comp_rgb(ride, 0x4a);          /* (lightness / shine: the material, as without matte) */
+    }
+    for (a = 0x600; a < 0x1e00; a += 4) {                               /* the near / middle / far texture tables */
+        DWORD *e = (DWORD *)(cri + a); BYTE *ti, *o, *c;
+        if (e[1] - hW > 5 && e[1] - hS > 5) continue;                  /* E18: DUMMY_WHEEL1..6 / DUMMY_SPINNER1..6 (one per car instance) */
+        ti = (BYTE *)e[2]; if (!ti || ti == (BYTE *)-1) continue;
+        o = matte_orig(ti);
+        if (!on) { if (o != ti) e[2] = (DWORD)o; continue; }
+        if (!readable(o, 0x7c) || *(DWORD *)(o + 0x24) != e[1]) continue;
+        if ((c = matte_tex(o, e[1] - hW <= 5 ? rgbW : rgbS)) && (BYTE *)e[2] != c) e[2] = (DWORD)c;
+    }
+}
 static long g_cNeon;
 /* E2: cars the game drew since the last frame callback. Remembered car pointers (purge re-runs, decal re-tints) are used
    only while their car is in this table: a car the shop freed is never drawn again, so it is never written to. */
@@ -1344,6 +1646,8 @@ static void neon_fix_(BYTE *cri)
     if (!st->mask && !mine(ride)) return;           /* someone else's car, never touched */
     /* E9: decal spots checked every frame on our drawn cars - the decal list swaps decals on the shown car without a paint
        re-read, so it kept the tinted copies of older decals (4 repeated while scrolling) until a colour change */
+    /* (E23: no texture copy - the dump of DUMMY_WHEELn showed only the neutral tyre / hub picture, the rim colour comes from
+       the rim material; matte_fix is not called) */
     if (mine(ride) && g_kindOn[K_PAINT]) { __try { decal_fix(cri, ride); } __except (EXCEPTION_EXECUTE_HANDLER) { static int n; if (n++ < 5) clog("decal colour: frame fix exception 0x%08lx", GetExceptionCode()); } }
     for (g = 0; g < 5; g++) {
         int slot = g < 4 ? 0x9a + g : 0x9f, on = g_kindOn[g < 4 ? K_NEON : K_LIGHT] && custom_for(ride, slot, &rgb);
@@ -1510,7 +1814,7 @@ static void set_slot(const char *car, BYTE *r, int slot, DWORD rgb, int on)
     } else if ((e = find_r(car, r, slot))) { *e = g_e[--g_ne]; }
     LeaveCriticalSection(&g_cs);
     for (i = 0; i < NSLOT; i++) if (SLOTS[i].slot == slot && (SLOTS[i].kind == K_PAINT || SLOTS[i].kind == K_SHINE || SLOTS[i].kind == K_GLOSS)) InterlockedIncrement(&g_ver);
-    if ((slot & 0xF00) == 0x500) InterlockedIncrement(&g_ver);
+    if ((slot & 0xF00) == 0x500 || (slot & 0xF00) == 0x600 || (slot & 0xF00) == 0x700) InterlockedIncrement(&g_ver);
     g_dirty = 1; g_dirtyAt = GetTickCount();
 }
 static int step_sel(int dir)
@@ -1930,7 +2234,7 @@ static void button(IDirect3DDevice9 *d, float x, float y, float w, float h, floa
     quad(d, x + t, y + h - r, r - t, r - t, 0xFFD0D0C8); quad(d, x + w - r, y + h - r, r - t, r - t, 0xFFD0D0C8);
 }
 #define GAME_GREEN 0xFFC8E870
-static float g_tab[4][4], g_shR[4]; static int g_tabsOn, g_tabBase = 0x3f; static float g_glR[4], g_saR[4];   /* g_saR: v1.1 saturation slider */
+static float g_tab[4][4], g_shR[4]; static int g_tabsOn, g_tabBase = 0x3f; static float g_glR[4], g_saR[4], g_liR[4], g_mtR[4];   /* g_saR: v1.1 saturation slider */
 static int slot_index(int slot);
 static int purge_wheels(void), purge_col2(void);
 static int purge_tab_slot(int t)          /* purge tabs: 0 Hood, 1 Wheels (keep colour 1/2), 2 Colour 1, 3 Colour 2 (keep the stream) */
@@ -1940,7 +2244,7 @@ static int purge_tab_slot(int t)          /* purge tabs: 0 Hood, 1 Wheels (keep 
 }
 
 #define NPRE 10
-typedef struct { int used, hasShine; DWORD base, shine, sat; } Pre;     /* sat: v1.1 saturation 0..255 (128 = 100 %) */
+typedef struct { int used, hasShine; DWORD base, shine, sat, lit, matte; } Pre;     /* sat / lit: saturation / lightness 0..255 (128 = 100 %) */
 static int has_sat_slot(int bs) { int i; for (i = 0; i < NSLOT; i++) if (SLOTS[i].slot == (0x500 | bs)) return 1; return 0; }
 static Pre g_pre[NPRE]; static char g_preFile[MAX_PATH]; static float g_preR[NPRE][4], g_saveR[4], g_delR[4]; static int g_delMode;   /* Delete button: next swatch click deletes it */
 static void load_pre(void)
@@ -1949,7 +2253,11 @@ static void load_pre(void)
     if (!f) return;
     while (n < NPRE && fgets(ln, sizeof ln, f)) {
         if (ln[0] == ';') continue;
-        if ((nt = sscanf(ln, "%x %15s %u", &b, t, &sa)) < 1) continue;
+        {   unsigned li = 128, mt = 0;
+            if ((nt = sscanf(ln, "%x %15s %u %u %u", &b, t, &sa, &li, &mt)) < 1) continue;
+            g_pre[n].lit = nt >= 4 && li <= 255 ? li : 128;
+            g_pre[n].matte = nt >= 5 ? (mt & 1) : 0;
+        }
         g_pre[n].used = 1; g_pre[n].base = b & 0xFFFFFF;
         g_pre[n].sat = nt >= 3 && sa <= 255 ? sa : 128;                      /* older lines: 100 % */
         g_pre[n].hasShine = t[0] != '-' && sscanf(t, "%x", &sh) == 1; g_pre[n].shine = g_pre[n].hasShine ? sh & 0xFFFFFF : 0;
@@ -1963,7 +2271,8 @@ static void save_pre(void)
     if (!f) { clog("cannot write %s", g_preFile); return; }
     fprintf(f, "; NFSU2_CustomColor - my colours: base RRGGBB, shine RRGGBB or -, saturation 0-255 (128 = 100 %%)\n");
     for (i = 0; i < NPRE; i++) if (g_pre[i].used) {
-        if (g_pre[i].hasShine) fprintf(f, "%06X %06X %u\n", g_pre[i].base, g_pre[i].shine, g_pre[i].sat); else fprintf(f, "%06X - %u\n", g_pre[i].base, g_pre[i].sat);
+        if (g_pre[i].hasShine) fprintf(f, "%06X %06X %u %u %u\n", g_pre[i].base, g_pre[i].shine, g_pre[i].sat, g_pre[i].lit ? g_pre[i].lit : 128, g_pre[i].matte);
+        else fprintf(f, "%06X - %u %u %u\n", g_pre[i].base, g_pre[i].sat, g_pre[i].lit ? g_pre[i].lit : 128, g_pre[i].matte);
     }
     fclose(f);
 }
@@ -1977,10 +2286,13 @@ static void pre_click(int i, int shift)
         set_slot(g_pCar, r, bs, g_pre[i].base, 1);
         set_slot(g_pCar, r, shine_of(bs), g_pre[i].shine, g_pre[i].hasShine);
         if (sat_slot_ok(bs)) set_slot(g_pCar, r, 0x500 | bs, g_pre[i].sat ? g_pre[i].sat : 128, g_pre[i].sat && g_pre[i].sat != 128);   /* v1.1 */
+        if (sat_slot_ok(bs)) set_slot(g_pCar, r, 0x600 | bs, g_pre[i].lit ? g_pre[i].lit : 128, g_pre[i].lit && g_pre[i].lit != 128);   /* v1.2 */
+        /* (E22: the old matte column is ignored - the shine amount carries the matte look) */
         g_sel = slot_index(bs);
     } else {
         set_slot(g_pCar, r, SLOTS[g_sel].slot, g_pre[i].base, 1);
         if (sat_slot_ok(SLOTS[g_sel].slot)) set_slot(g_pCar, r, 0x500 | bs, g_pre[i].sat ? g_pre[i].sat : 128, g_pre[i].sat && g_pre[i].sat != 128);   /* E13 */
+        if (sat_slot_ok(SLOTS[g_sel].slot)) set_slot(g_pCar, r, 0x600 | bs, g_pre[i].lit ? g_pre[i].lit : 128, g_pre[i].lit && g_pre[i].lit != 128);   /* v1.2 */
     }
     g_lastPick = g_pre[i].base; g_lastPickOk = 1;
     load_sel();
@@ -1995,7 +2307,10 @@ static void pre_save(void)
         e = find_e(g_pCar, bs); p.base = e && 0 != part_hash(part_of(r, bs)) ? e->rgb : game_rgb(r, bs);
         e = find_e(g_pCar, shine_of(bs)); if (e && 0 != part_hash(part_of(r, bs))) { p.hasShine = 1; p.shine = e->rgb; }
         e = find_e(g_pCar, 0x500 | bs); p.sat = e ? e->rgb & 255 : 128;          /* v1.1: the saturation goes with the swatch */
-    } else { p.base = hsv_rgb(g_h, g_s, g_v); e = sat_slot_ok(SLOTS[g_sel].slot) ? find_e(g_pCar, 0x500 | bs) : NULL; p.sat = e ? e->rgb & 255 : 128; }
+        e = find_e(g_pCar, 0x600 | bs); p.lit = e ? e->rgb & 255 : 128;          /* v1.2: and the lightness */
+        e = bs == 0x49 ? find_e(g_pCar, 0x749) : NULL; p.matte = e && (e->rgb & 1);
+    } else { p.base = hsv_rgb(g_h, g_s, g_v); e = sat_slot_ok(SLOTS[g_sel].slot) ? find_e(g_pCar, 0x500 | bs) : NULL; p.sat = e ? e->rgb & 255 : 128;
+             e = sat_slot_ok(SLOTS[g_sel].slot) ? find_e(g_pCar, 0x600 | bs) : NULL; p.lit = e ? e->rgb & 255 : 128; }
     LeaveCriticalSection(&g_cs);
     memmove(&g_pre[1], &g_pre[0], (NPRE - 1) * sizeof(Pre)); g_pre[0] = p; save_pre();
     clog("my colours: saved %06lX (saturation %d %%)", p.base, (int)(p.sat * 100 / 128.f + 0.5f));
@@ -2010,6 +2325,12 @@ static void apply_mouse(void)
         else if (mx >= g_hx && mx <= g_hx + g_hw && my >= g_hy && my <= g_hy + g_hh) { g_mDrag = 2; if (g_s < 0.1f || g_v < 0.1f) { g_s = 1.f; g_v = 1.f; } }   /* hue on white / black: give it full colour */
         else if (g_tabsOn == 1 && g_tabBase == 0x3f && g_glR[2] > 0 && mx >= g_glR[0] - 3 && mx <= g_glR[0] + g_glR[2] + 3 && my >= g_glR[1] - 4 && my <= g_glR[1] + g_glR[3] + 4) g_mDrag = 5;
         else if (g_tabsOn == 1 && g_shR[2] > 0 && mx >= g_shR[0] - 3 && mx <= g_shR[0] + g_shR[2] + 3 && my >= g_shR[1] - 4 && my <= g_shR[1] + g_shR[3] + 4) g_mDrag = 6;
+        else if (0 && g_mtR[2] > 0 && mx >= g_mtR[0] - 2 && mx <= g_mtR[0] + g_mtR[2] + 2 && my >= g_mtR[1] - 2 && my <= g_mtR[1] + g_mtR[3] + 2) {   /* (E22: no checkbox) */
+            Entry *me; int was; EnterCriticalSection(&g_cs); me = find_e(g_pCar, 0x749); was = me && (me->rgb & 1); LeaveCriticalSection(&g_cs);
+            set_slot(g_pCar, slot_ride(g_sel), 0x749, 1, !was); g_mDrag = 3;
+            clog("shop: matte rims %s", was ? "off" : "on");
+        }
+        else if (g_liR[2] > 0 && mx >= g_liR[0] - 3 && mx <= g_liR[0] + g_liR[2] + 3 && my >= g_liR[1] - 4 && my <= g_liR[1] + g_liR[3] + 4) g_mDrag = 8;
         else if (g_saR[2] > 0 && mx >= g_saR[0] - 3 && mx <= g_saR[0] + g_saR[2] + 3 && my >= g_saR[1] - 4 && my <= g_saR[1] + g_saR[3] + 4) g_mDrag = 7;
         else {
             int t;
@@ -2046,6 +2367,11 @@ static void apply_mouse(void)
     if (g_mDrag == 6 && g_shR[2] > 0) {
         int av = (int)(min(1.f, max(0.f, (mx - g_shR[0]) / g_shR[2])) * 255.f + 0.5f);
         set_slot(g_pCar, slot_ride(g_sel), 0x300 | g_tabBase, (DWORD)av, 1);
+    }
+    if (g_mDrag == 8 && g_liR[2] > 0) {                   /* v1.2 lightness: 0..255, 128 = 100 % (snaps to 100 % near the mark) */
+        int lv = (int)(min(1.f, max(0.f, (mx - g_liR[0]) / g_liR[2])) * 255.f + 0.5f);
+        if (lv > 123 && lv < 133) lv = 128;
+        set_slot(g_pCar, slot_ride(g_sel), 0x600 | g_tabBase, (DWORD)lv, 1);
     }
     if (g_mDrag == 7 && g_saR[2] > 0) {                   /* v1.1 saturation: 0..255, 128 = 100 % (snaps to 100 % near the mark) */
         int sv = (int)(min(1.f, max(0.f, (mx - g_saR[0]) / g_saR[2])) * 255.f + 0.5f);
@@ -2744,26 +3070,48 @@ static void draw_shop_picker(IDirect3DDevice9 *d, int W, int H)
         quad(d, g_shR[0] + 128.f / 255.f * g_shR[2] - 0.25f * s, g_shR[1] + g_shR[3] + 1 * s, 0.5f * s, 2 * s, 0xFF8A8A96);   /* 100 % mark */
         frame(d, g_shR[0] + am / 255.f * g_shR[2] - 1.5f * s, g_shR[1] - 2 * s, 3 * s, g_shR[3] + 4 * s, 0.8f * s, ah ? 0xFFFFFFFF : 0xFF8A8A96);
     }
-    g_saR[2] = 0;
-    if (g_tabsOn == 1 || (g_tabsOn == 0 && sat_slot_ok(SLOTS[g_sel].slot))) {   /* v1.1 Saturation (0..200 %, 100 % = as before) */
-        BYTE *rr = slot_ride(g_sel); Entry *se; DWORD sv, bcs; int sh2; char pct[16];
-        float ly = g_tabsOn == 1 ? 21.5f : 22.5f, by2 = g_tabsOn == 1 ? 24.5f : 25.f;      /* (picture vinyls: under the preset row) */
+    g_mtR[2] = 0;
+    if (0 && g_tabsOn == 1 && (g_tabBase == 0x49 || g_tabBase == 0x4a)) {     /* (E22: the Matte checkbox is gone - the Shine slider's low end) */
+        Entry *me; int on2; float bx2 = g_hx, by3 = g_hy + g_hh + 14.f * s, ls2 = 8.f * s / g_fontH;   /* (the Gloss place: rims have no Gloss) */
+        float mxp = g_mx / 10000.f * W, myp = g_my / 10000.f * H;
+        EnterCriticalSection(&g_cs); me = find_e(g_pCar, 0x749); on2 = me && (me->rgb & 1); LeaveCriticalSection(&g_cs);
+        g_mtR[0] = bx2; g_mtR[1] = by3; g_mtR[2] = 34 * s; g_mtR[3] = 8 * s;
+        quad(d, bx2, by3, 8 * s, 8 * s, 0xFF141418);
+        frame(d, bx2, by3, 8 * s, 8 * s, 0.7f * s, (g_mx >= 0 && in_r(g_mtR, mxp, myp)) ? GAME_GREEN : 0xFF8A8A96);
+        if (on2) quad(d, bx2 + 2 * s, by3 + 2 * s, 4 * s, 4 * s, GAME_GREEN);
+        text(d, "Matte", bx2 + 11 * s, by3 - 0.5f * s, ls2, on2 ? GAME_GREEN : 0xFFFFFFFF);
+    }
+    g_saR[2] = 0; g_liR[2] = 0;
+    if (g_tabsOn == 1 || (g_tabsOn == 0 && sat_slot_ok(SLOTS[g_sel].slot))) {   /* Saturation | Lightness (0..200 %, 100 % = as before) */
+        BYTE *rr = slot_ride(g_sel); Entry *se; DWORD sv, lv, bcs; int hs, hl, q; char pct[16];
+        float ly = g_tabsOn == 1 ? 21.5f : 22.5f, by2 = g_tabsOn == 1 ? 24.5f : 25.f, ls = 7.5f * s / g_fontH, half = (g_hw - 4 * s) / 2;
+        float mxp = g_mx / 10000.f * W, myp = g_my / 10000.f * H;
         EnterCriticalSection(&g_cs);
-        se = find_e(g_pCar, 0x500 | g_tabBase); sh2 = se != NULL; sv = sh2 ? se->rgb & 255 : 128;
+        se = find_e(g_pCar, 0x500 | g_tabBase); hs = se != NULL; sv = hs ? se->rgb & 255 : 128;
+        se = find_e(g_pCar, 0x600 | g_tabBase); hl = se != NULL; lv = hl ? se->rgb & 255 : 128;
         if (g_tabsOn == 1) { se = find_e(g_pCar, g_tabBase); bcs = se && 0 != part_hash(part_of(rr, g_tabBase)) ? se->rgb : game_rgb(rr, g_tabBase); }
         else bcs = shown;
         LeaveCriticalSection(&g_cs);
         if (g_tabsOn == 1 && SLOTS[g_sel].slot == g_tabBase && sel_custom()) bcs = hsv_rgb(g_h, g_s, g_v);
-        text(d, "Saturation", g_hx, g_hy + g_hh + ly * s, 7.5f * s / g_fontH, GAME_GREEN);
-        g_saR[0] = g_hx + 40 * s; g_saR[1] = g_hy + g_hh + by2 * s; g_saR[2] = g_hw - 40 * s - 26 * s; g_saR[3] = 3.5f * s;
-        {   DWORD c0 = argb(sat_rgb(bcs, 0.f), 255), c1 = argb(bcs, 255), c2 = argb(sat_rgb(bcs, 2.f), 255); float hw2 = g_saR[2] * 128.f / 255.f;
-            quad4(d, g_saR[0], g_saR[1], hw2, g_saR[3], c0, c1, c0, c1);
-            quad4(d, g_saR[0] + hw2, g_saR[1], g_saR[2] - hw2, g_saR[3], c1, c2, c1, c2); }
-        frame(d, g_saR[0] - 0.5f * s, g_saR[1] - 0.5f * s, g_saR[2] + 1 * s, g_saR[3] + 1 * s, 0.5f * s, 0xFF4A4A52);
-        quad(d, g_saR[0] + 128.f / 255.f * g_saR[2] - 0.25f * s, g_saR[1] + g_saR[3] + 1 * s, 0.5f * s, 1.5f * s, 0xFF8A8A96);   /* 100 % mark */
-        frame(d, g_saR[0] + sv / 255.f * g_saR[2] - 1.5f * s, g_saR[1] - 2 * s, 3 * s, g_saR[3] + 4 * s, 0.8f * s, sh2 ? 0xFFFFFFFF : 0xFF8A8A96);
-        sprintf(pct, "%d %%", (int)(sv * 100 / 128.f + 0.5f));
-        text(d, pct, g_saR[0] + g_saR[2] + 4 * s, g_hy + g_hh + ly * s, 7.5f * s / g_fontH, sh2 ? 0xFFFFFFFF : 0xFF8A8A96);
+        for (q = 0; q < 2; q++) {
+            float *R2 = q ? g_liR : g_saR, x0 = g_hx + q * (half + 4 * s); DWORD val = q ? lv : sv; int has = q ? hl : hs;
+            DWORD c0 = argb(q ? lit_rgb(bcs, 0.25f) : sat_rgb(bcs, 0.f), 255), c1 = argb(bcs, 255), c2 = argb(q ? lit_rgb(bcs, 1.75f) : sat_rgb(bcs, 2.f), 255);
+            float hw2, tx;
+            text(d, q ? "Lightness" : "Saturation", x0, g_hy + g_hh + ly * s, ls, GAME_GREEN);
+            tx = text_w("Saturation", ls) + 3 * s;
+            R2[0] = x0 + tx; R2[1] = g_hy + g_hh + by2 * s; R2[2] = half - tx - 1 * s; R2[3] = 3.5f * s;
+            hw2 = R2[2] * 128.f / 255.f;
+            quad4(d, R2[0], R2[1], hw2, R2[3], c0, c1, c0, c1);
+            quad4(d, R2[0] + hw2, R2[1], R2[2] - hw2, R2[3], c1, c2, c1, c2);
+            frame(d, R2[0] - 0.5f * s, R2[1] - 0.5f * s, R2[2] + 1 * s, R2[3] + 1 * s, 0.5f * s, 0xFF4A4A52);
+            quad(d, R2[0] + 128.f / 255.f * R2[2] - 0.25f * s, R2[1] + R2[3] + 1 * s, 0.5f * s, 1.5f * s, 0xFF8A8A96);   /* 100 % mark */
+            frame(d, R2[0] + val / 255.f * R2[2] - 1.5f * s, R2[1] - 2 * s, 3 * s, R2[3] + 4 * s, 0.8f * s, has ? 0xFFFFFFFF : 0xFF8A8A96);
+            if ((g_mDrag == (q ? 8 : 7)) || (g_mx >= 0 && mxp >= R2[0] - 3 && mxp <= R2[0] + R2[2] + 3 && myp >= R2[1] - 5 && myp <= R2[1] + R2[3] + 5)) {
+                float w2; sprintf(pct, "%d %%", (int)((q ? lit_of(val) : val / 128.f) * 100.f + 0.5f)); w2 = text_w(pct, ls);
+                quad(d, R2[0] + val / 255.f * R2[2] - w2 / 2 - 1.5f * s, R2[1] - 10.5f * s, w2 + 3 * s, 8 * s, 0xF0141418);
+                text(d, pct, R2[0] + val / 255.f * R2[2] - w2 / 2, R2[1] - 10.f * s, ls, 0xFFFFFFFF);
+            }
+        }
     }
     if (g_tabsOn) {                       /* Base / Shine tabs, right end of the name row */
         int t;
@@ -4132,6 +4480,8 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD why, LPVOID r)
       GetPrivateProfileStringA("CustomColor", "OrbitHeight", "0", b3, sizeof b3, ini); g_orbIniH = (float)atof(b3); }
     { char b2[32]; GetPrivateProfileStringA("CustomColor", "ShineStrength", "1.6", b2, sizeof b2, ini); g_shineMax = (float)atof(b2); if (g_shineMax < 1.f || g_shineMax > 8.f) g_shineMax = 1.6f; }   /* 0 = 2nd skin slot (trunk box, trim) gets a plain copy, no shine */
     { char b[32]; GetPrivateProfileStringA("CustomColor", "PartBrightness", "1.35", b, sizeof b, ini); g_partBright = (float)atof(b); if (g_partBright < 0.3f || g_partBright > 4.f) g_partBright = 1.35f;
+      GetPrivateProfileStringA("CustomColor", "MatteEven", "1.6", b, sizeof b, ini); g_matteEven = (float)atof(b); if (g_matteEven < 1.f || g_matteEven > 4.f) g_matteEven = 1.6f;
+      GetPrivateProfileStringA("CustomColor", "MatteTexture", "35", b, sizeof b, ini); g_matteKeep = (float)atof(b) / 100.f; if (g_matteKeep < 0.f || g_matteKeep > 1.f) g_matteKeep = 0.35f;
       GetPrivateProfileStringA("CustomColor", "RimBrightness", "2.0", b, sizeof b, ini); g_rimBright = (float)atof(b); if (g_rimBright < 0.3f || g_rimBright > 4.f) g_rimBright = 2.0f; }     /* 1 = never use NFSU2_HDToggle for drawing */
     GetPrivateProfileStringA("CustomColor", "File", "NFSU2_CustomColor.txt", k, sizeof k, ini);
     if (strchr(k, ':')) strcpy(g_store, k); else sprintf(g_store, "%s\\%s", g_dir, k);

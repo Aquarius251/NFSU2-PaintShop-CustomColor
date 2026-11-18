@@ -3,7 +3,16 @@
 Any colour for every part of your car in **Need for Speed Underground 2** (PC, v1.2).
 It is an ASI plugin. The game's own files are never changed.
 
-**Download:** see [Releases](../../releases). Get `NFSU2_CustomColor_v1.1.zip`.
+**Download:** see [Releases](../../releases). Get `NFSU2_CustomColor_v1.2.zip`.
+
+## New in v1.2
+
+- **Lightness slider** (0-300 %) next to Saturation. Each part, vinyl and decal has its own, and My colours remembers it.
+  Below 100 % is darker. Above 100 % the dark shading fills in first, then it gets brighter: clean, bright white paint and rims.
+- **Rims: Shine down to 0 % = matte.** It fades out the chrome reflection and highlights and evens out the dark faces,
+  so white or coloured rims look like painted matte rims. The tyres are never touched.
+- **Shine 0 % on paint** switches off the paint type's own pearl/metallic tint, so the colour shows exactly as picked.
+- The Shine slider changes smoothly near 0 %, with no jump.
 
 ## What it does
 
@@ -14,9 +23,11 @@ It is an ASI plugin. The game's own files are never changed.
 - Picture vinyls (Art Factory, Contest, Unique) can be tinted too. **Default** shows the picture as it was drawn.
 - The car on the turntable changes live while you pick.
 - **Saturation slider** (0-200 %). Each part, vinyl and decal has its own, and dark colours stay rich.
-- **Base + Shine** colours for paints give a two-tone pearl. A slider sets how strong the shine is.
+- **Lightness slider** (0-300 %). Darker or brighter, up to clean white. Each part, vinyl and decal has its own.
+- **Base + Shine** colours for paints and rims give a two-tone pearl. A slider sets how strong the shine is.
+  On rims, Shine at 0 % gives a matte painted look (no chrome).
 - Gloss / Metallic / Pearlescent still work. Your colour stays, and only the finish changes.
-- **My colours**: 10 saved swatches, with their saturation, shared by all cars.
+- **My colours**: 10 saved swatches, with their saturation and lightness, shared by all cars.
 - Every vinyl layer and decal slot keeps its colour while you browse, install, leave the shop or restart.
 - K / L turn the car in the shops (hold; Shift = faster).
 - Colours are saved per car and stay in races, in free roam and after a restart.
